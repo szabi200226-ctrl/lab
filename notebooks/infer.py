@@ -37,10 +37,10 @@ from mpl_toolkits.mplot3d import Axes3D
 celltype_test_data = '/mnt/d/Szabolcs/test/CEED/checkpoint/CEED/CEED/example_datasets/IBL_400neuron_200spike_dataset'
 
 
-spikes_test_full = np.load(celltype_test_data + '/spikes_test.npy')
-print(f"Original spikes_test shape: {spikes_test_full.shape}")
-spikes_test = spikes_test_full[:,0]  # Single channel for backwards compatibility
+spikes_test = np.load(celltype_test_data + '/spikes_test.npy')[:,0]
 labels_test = np.load(celltype_test_data + '/labels_test.npy')
+print(f"Loaded single-channel spikes_test shape: {spikes_test.shape}")
+
 
 # %% [markdown]
 # ### Load a checkpoint into a CEED model
@@ -120,191 +120,214 @@ print(f"\nAvailable unit IDs ({len(unique_labels)} total): {unique_labels[:20]}.
 embeddings = fc_pca_ceed_emb
 
 fig, axes = plt.subplots(1,1, figsize=(8,8))
-unit_ids = [1,2,11,45]
+#unit_ids = [1,2,11,45]
+unit_ids = [2,11,12,45,50]
 colors = cc.glasbey[:len(unit_ids)]
 vertical_offset = 0
 for i, unit_id in enumerate(unit_ids):
     unit_ceed_emb = embeddings[labels_nonzero==unit_id]
     unit_spikes = spikes_nonzero[labels_nonzero==unit_id]
-    #unit_spikes_full = spikes_nonzero_full[labels_nonzero==unit_id]
     
-    # Skip if no data for this unit
     if len(unit_ceed_emb) == 0:
         print(f"Warning: No data found for unit {unit_id}, skipping")
         continue
     
-    # Use full multi-channel data for template to match load_and_transform processing
-    #template_full = np.median(unit_spikes_full,0)
-    #print(f"Unit {unit_id}: template_full shape: {template_full.shape}")
+    # Use single-channel template (shape: (121,))
+    template = np.median(unit_spikes, 0)
+    print(f"Unit {unit_id}: template shape: {template.shape}")
     
-    # Transform expects (N, C, L) format: N samples, C channels, L length
-    #template_tensor = torch.from_numpy(template_full).float().unsqueeze(0)
-    #print(f"Unit {unit_id}: template_tensor shape: {template_tensor.shape}")
+    # Transform expects (N, 1, L) for single-channel: (batch, channel, length)
+    template_tensor = torch.from_numpy(template).float().unsqueeze(0).unsqueeze(0)
+    print(f"Unit {unit_id}: template_tensor shape: {template_tensor.shape}")
     
-    #template_emb = fc_celltype_ceed_5d.transform(template_tensor)
+    template_emb = fc_celltype_ceed_5d.transform(template_tensor)
     
-    # Convert to numpy if it's a torch tensor
     if isinstance(template_emb, torch.Tensor):
         template_emb = template_emb.cpu().numpy()
     
     print(f"Unit {unit_id}: template_emb shape: {template_emb.shape}, has NaN: {np.isnan(template_emb).any()}")
-    if np.isnan(template_emb).any():
-        print(f"  NaN locations: {np.where(np.isnan(template_emb))}")
-        print(f"  template_full stats: min={template_full.min():.3f}, max={template_full.max():.3f}, mean={template_full.mean():.3f}")
     
-    # Reshape template_emb to match PCA input dimensions (flatten to 2D)
+    # The transform may output (T, D) or (1, T, D) or (D,). We need (1, T*D) for PCA.
+    # Match what was done for fc_pca_ceed_emb_nonzero (which was reshaped to (N, 105))
+    original_shape = template_emb.shape
     if len(template_emb.shape) == 3:
-        # Flatten from (1, 21, 5) to (1, 105)
-        template_emb = template_emb.reshape(template_emb.shape[0], -1)
-        print(f"Unit {unit_id}: reshaped 3D -> {template_emb.shape}")
+        # (1, T, D) -> flatten to (1, T*D)
+        template_emb = template_emb.reshape(1, -1)
     elif len(template_emb.shape) == 2:
-        # If it's 2D (e.g., (21, 5)), add batch dimension then flatten
+        # (T, D) -> flatten to (1, T*D)
         template_emb = template_emb.reshape(1, -1)
-        print(f"Unit {unit_id}: reshaped 2D -> {template_emb.shape}")
     elif len(template_emb.shape) == 1:
+        # (D,) -> (1, D) - but this may still be wrong if it should be (1, T*D)
+        # Check if this matches PCA input dim
         template_emb = template_emb.reshape(1, -1)
-        print(f"Unit {unit_id}: reshaped 1D -> {template_emb.shape}")
     
-    # Check for NaN - use median of unit's original embeddings and project through PCA
+    print(f"Unit {unit_id}: after reshape {original_shape} -> {template_emb.shape}")
+    
+    # Verify dimensions match PCA expectations
+    expected_features = fc_pca_ceed.n_features_in_
+    if template_emb.shape[1] != expected_features:
+        print(f"Warning: template_emb has {template_emb.shape[1]} features but PCA expects {expected_features}")
+        print(f"This suggests the single-template transform output differs from batch transform.")
+        print(f"Falling back to median of unit embeddings.")
+        # Fallback: use median of unit's high-dim embeddings
+        unit_emb_highdim = fc_pca_ceed_emb_nonzero[labels_nonzero==unit_id]
+        template_emb = np.median(unit_emb_highdim, axis=0).reshape(1, -1)
+
     if np.isnan(template_emb).any():
         print(f"Warning: NaN in template_emb for unit {unit_id}, using median of unit's embeddings")
-        # Get the median of this unit's embeddings in the original high-dim space
         unit_emb_highdim = fc_pca_ceed_emb_nonzero[labels_nonzero==unit_id]
         median_emb_highdim = np.median(unit_emb_highdim, axis=0).reshape(1, -1)
         pc_template_emb = fc_pca_ceed.transform(median_emb_highdim)[0]
-        print(f"  Using median of {len(unit_emb_highdim)} embeddings")
     else:
         pc_template_emb = fc_pca_ceed.transform(template_emb)[0]
         
-    print(f"Unit {unit_id}: Marker at ({pc_template_emb[0]:.3f}, {pc_template_emb[1]:.3f}), cloud center: ({np.mean(unit_ceed_emb[:,0]):.3f}, {np.mean(unit_ceed_emb[:,1]):.3f})")
+    print(f"Unit {unit_id}: Marker at ({pc_template_emb[0]:.3f}, {pc_template_emb[1]:.3f})")
     
-    # axes[0].plot(unit_spikes.T + vertical_offset, color=colors[i], alpha=.01);
-    # axes[0].plot(template.T + vertical_offset, color=colors[i], alpha=1);
-    # axes[0].annotate(str(unit_id), xy=(0,vertical_offset+.3))
-    vertical_offset += 1.5
     axes.scatter(unit_ceed_emb[:,0], unit_ceed_emb[:,1], color=colors[i], alpha=.2)
-    axes.scatter(pc_template_emb[0], pc_template_emb[1], color=colors[i], alpha=1,marker="^", s=200, label=str(unit_id), edgecolors='black', linewidths=1)
-# axes[0].vlines([42], ymax=vertical_offset, ymin= -1.5, ls='--', color='black')
+    axes.scatter(pc_template_emb[0], pc_template_emb[1], color=colors[i], alpha=1,
+                marker="^", s=200, label=str(unit_id), edgecolors='black', linewidths=1)
+
+
+
 axes.set_xticks([])
 axes.set_yticks([])
-# plt.legend();
 plt.savefig('pca_embeddings_simple.png', dpi=150, bbox_inches='tight')
 print('Saved: pca_embeddings_simple.png')
+
+
+
+# ...existing code...
 
 # %%
 embeddings = fc_pca_ceed_emb
 
 fig, axes = plt.subplots(1,2, figsize=(12,4))
-unit_ids = [8,5,12,17,68]
+unit_ids = [2,11,12,45,50]
 colors = cc.glasbey[:len(unit_ids)]
 vertical_offset = 0
 for i, unit_id in enumerate(unit_ids):
     unit_ceed_emb = embeddings[labels_nonzero==unit_id]
     unit_spikes = spikes_nonzero[labels_nonzero==unit_id]
-    #unit_spikes_full = spikes_nonzero_full[labels_nonzero==unit_id]
     
-    # Use full multi-channel data for template to match load_and_transform processing
-    #template_full = np.median(unit_spikes_full,0)
-    template = np.median(unit_spikes,0)  # Keep single-channel for plotting
+    if len(unit_ceed_emb) == 0:
+        print(f"Warning: No data found for unit {unit_id}, skipping")
+        continue
     
-    # Transform expects (N, C, L) format: N samples, C channels, L length
-    #template_tensor = torch.from_numpy(template_full).float().unsqueeze(0)
+    # Use single-channel template
+    template = np.median(unit_spikes, 0)
+    
+    # Transform expects (N, 1, L) for single-channel
+    template_tensor = torch.from_numpy(template).float().unsqueeze(0).unsqueeze(0)
     template_emb = fc_celltype_ceed_5d.transform(template_tensor)
     
-    # Convert to numpy if it's a torch tensor
     if isinstance(template_emb, torch.Tensor):
         template_emb = template_emb.cpu().numpy()
     
-    # Reshape template_emb to match PCA input dimensions (flatten to 2D)
+    # Reshape to 2D
+    original_shape = template_emb.shape
     if len(template_emb.shape) == 3:
-        # Flatten from (1, 21, 5) to (1, 105)
-        template_emb = template_emb.reshape(template_emb.shape[0], -1)
+        template_emb = template_emb.reshape(1, -1)
     elif len(template_emb.shape) == 2:
-        # If it's 2D (e.g., (21, 5) or (1, 5)), flatten to (1, N*D)
         template_emb = template_emb.reshape(1, -1)
     elif len(template_emb.shape) == 1:
         template_emb = template_emb.reshape(1, -1)
     
-    # Convert to numpy if it's a torch tensor
-    if isinstance(template_emb, torch.Tensor):
-        template_emb = template_emb.cpu().numpy()
+    print(f"Unit {unit_id}: after reshape {original_shape} -> {template_emb.shape}")
     
-    # Reshape to 2D if needed
-    if len(template_emb.shape) == 3:
-        template_emb = template_emb.reshape(template_emb.shape[0], -1)
-    elif len(template_emb.shape) == 2 and template_emb.shape[0] != 1:
-        template_emb = template_emb.reshape(1, -1)
+    # ADD THIS DIMENSION CHECK (same as first cell):
+    expected_features = fc_pca_ceed.n_features_in_
+    if template_emb.shape[1] != expected_features:
+        print(f"Warning: template_emb has {template_emb.shape[1]} features but PCA expects {expected_features}")
+        print(f"Falling back to median of unit embeddings.")
+        unit_emb_highdim = fc_pca_ceed_emb_nonzero[labels_nonzero==unit_id]
+        template_emb = np.median(unit_emb_highdim, axis=0).reshape(1, -1)
     
-    # Check for NaN - use median of unit's original embeddings and project through PCA
+    # Handle NaN
     if np.isnan(template_emb).any():
-        print(f"Warning: NaN in template_emb for unit {unit_id}, using median of unit's embeddings")
+        print(f"Warning: NaN in template_emb for unit {unit_id}, using median")
         unit_emb_highdim = fc_pca_ceed_emb_nonzero[labels_nonzero==unit_id]
         median_emb_highdim = np.median(unit_emb_highdim, axis=0).reshape(1, -1)
         pc_template_emb = fc_pca_ceed.transform(median_emb_highdim)[0]
     else:
         pc_template_emb = fc_pca_ceed.transform(template_emb)[0]
         
-    axes[0].plot(unit_spikes.T + vertical_offset, color=colors[i], alpha=.01);
-    axes[0].plot(template.T + vertical_offset, color=colors[i], alpha=1);
+    axes[0].plot(unit_spikes.T + vertical_offset, color=colors[i], alpha=.01)
+    axes[0].plot(template.T + vertical_offset, color=colors[i], alpha=1)
     axes[0].annotate(str(unit_id), xy=(0,vertical_offset+.3))
     vertical_offset += 1.5
     axes[1].scatter(unit_ceed_emb[:,0], unit_ceed_emb[:,1], color=colors[i], alpha=.1)
-    axes[1].scatter(pc_template_emb[0], pc_template_emb[1], color=colors[i], alpha=1,marker="^", s=200, label=str(unit_id), edgecolors='black', linewidths=1)
-axes[0].vlines([42], ymax=vertical_offset, ymin= -1.5, ls='--', color='black')
-plt.legend();
+    axes[1].scatter(pc_template_emb[0], pc_template_emb[1], color=colors[i], alpha=1,
+                   marker="^", s=200, label=str(unit_id), edgecolors='black', linewidths=1)
+
+axes[0].vlines([42], ymax=vertical_offset, ymin=-1.5, ls='--', color='black', alpha=0.5, linewidth=1)
+axes[0].set_xlabel('Sample (timepoint)', fontsize=11)
+axes[0].set_ylabel('Amplitude (offset per unit)', fontsize=11)
+axes[0].set_title('Spike Waveforms', fontsize=12)
+axes[0].set_ylim(-1.5, vertical_offset)  # Set y limits for better view
+axes[0].grid(alpha=0.3, axis='x')
+
+# Adjust right panel (embeddings)
+axes[1].set_xlabel('PC1', fontsize=11)
+axes[1].set_ylabel('PC2', fontsize=11)
+axes[1].set_title('PCA Embeddings', fontsize=12)
+axes[1].grid(alpha=0.3)
+
+plt.legend(loc='best', fontsize=10)
+plt.tight_layout()
 plt.savefig('pca_embeddings_with_waveforms.png', dpi=150, bbox_inches='tight')
 print('Saved: pca_embeddings_with_waveforms.png')
 
-# %%
+
 embeddings = fc_umap_ceed_emb
 
 fig, axes = plt.subplots(1,2, figsize=(12,4))
-unit_ids = [8,5,12,17,68]
+unit_ids = [2,11,12,45,50]
 colors = cc.glasbey[:len(unit_ids)]
 vertical_offset = 0
 for i, unit_id in enumerate(unit_ids):
     unit_ceed_emb = embeddings[labels_nonzero==unit_id]
     unit_spikes = spikes_nonzero[labels_nonzero==unit_id]
-    #unit_spikes_full = spikes_nonzero_full[labels_nonzero==unit_id]
     
     # Skip if no data for this unit
     if len(unit_ceed_emb) == 0:
         print(f"Warning: No data found for unit {unit_id}, skipping")
         continue
     
-    # Use full multi-channel data for template to match load_and_transform processing
-    #template_full = np.median(unit_spikes_full,0)
-    template = np.median(unit_spikes,0)  # Keep single-channel for plotting
+    # Use single-channel template (shape: (121,))
+    template = np.median(unit_spikes, 0)
     
-    # Transform expects (N, C, L) format: N samples, C channels, L length
-    template_tensor = torch.from_numpy(template_full).float().unsqueeze(0)
-    template_emb = fc_celltype_ceed_5d.transform(template_tensor)
-    
-    # Convert to numpy if it's a torch tensor
-    if isinstance(template_emb, torch.Tensor):
-        template_emb = template_emb.cpu().numpy()
-    
-    # Reshape template_emb to match PCA input dimensions (flatten to 2D)
-    if len(template_emb.shape) == 3:
-        # Flatten from (1, 21, 5) to (1, 105)
-        template_emb = template_emb.reshape(template_emb.shape[0], -1)
-    elif len(template_emb.shape) == 2:
-        # If it's 2D (e.g., (21, 5) or (1, 5)), flatten to (1, N*D)
-        template_emb = template_emb.reshape(1, -1)
-    elif len(template_emb.shape) == 1:
-        template_emb = template_emb.reshape(1, -1)
-    
-    # For UMAP, just use median of the embeddings (can't project template through UMAP after fitting)
-    axes[0].plot(unit_spikes.T + vertical_offset, color=colors[i], alpha=.01);
-    axes[0].plot(template.T + vertical_offset, color=colors[i], alpha=1);
+    # Plot waveforms
+    axes[0].plot(unit_spikes.T + vertical_offset, color=colors[i], alpha=.01)
+    axes[0].plot(template.T + vertical_offset, color=colors[i], alpha=1)
     axes[0].annotate(str(unit_id), xy=(0,vertical_offset+.3))
     vertical_offset += 1.5
+    
+    # For UMAP, use median of embeddings (can't project new samples through fitted UMAP)
     axes[1].scatter(unit_ceed_emb[:,0], unit_ceed_emb[:,1], color=colors[i], alpha=.1)
-    #plot median of umap here because didn't do projection of template
-    axes[1].scatter(np.median(unit_ceed_emb,0)[0], np.median(unit_ceed_emb,0)[1], color=colors[i], alpha=1,marker='*', s=200, label=str(unit_id), edgecolors='black', linewidths=1)
-plt.legend();
+    median_emb = np.median(unit_ceed_emb, 0)
+    axes[1].scatter(median_emb[0], median_emb[1], color=colors[i], alpha=1,
+                   marker='*', s=200, label=str(unit_id), 
+                   edgecolors='black', linewidths=1)
+
+axes[0].vlines([42], ymax=vertical_offset, ymin=-1.5, ls='--', color='black', alpha=0.5, linewidth=1)
+axes[0].set_xlabel('Sample (timepoint)', fontsize=11)
+axes[0].set_ylabel('Amplitude (offset per unit)', fontsize=11)
+axes[0].set_title('Spike Waveforms', fontsize=12)
+axes[0].set_ylim(-1.5, vertical_offset)
+axes[0].grid(alpha=0.3, axis='x')
+
+# Adjust right panel
+axes[1].set_xlabel('UMAP1', fontsize=11)
+axes[1].set_ylabel('UMAP2', fontsize=11)
+axes[1].set_title('UMAP Embeddings', fontsize=12)
+axes[1].grid(alpha=0.3)
+
+plt.legend(loc='best', fontsize=10)
+plt.tight_layout()
 plt.savefig('umap_embeddings_with_waveforms.png', dpi=150, bbox_inches='tight')
 print('Saved: umap_embeddings_with_waveforms.png')
+
+
 
 # %% [markdown]
 # ### Transform without a data folder
@@ -315,5 +338,4 @@ cell_type_inference_data = np.load(os.path.join(celltype_test_data, 'spikes_test
 print("cell type data:", cell_type_inference_data.shape)
 transformed_inference_data = fc_celltype_ceed_5d.transform(cell_type_inference_data)
 print(transformed_inference_data.shape)
-
 
