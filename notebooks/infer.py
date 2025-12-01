@@ -183,7 +183,7 @@ for i, unit_id in enumerate(unit_ids):
         
     print(f"Unit {unit_id}: Marker at ({pc_template_emb[0]:.3f}, {pc_template_emb[1]:.3f})")
     
-    axes.scatter(unit_ceed_emb[:,0], unit_ceed_emb[:,1], color=colors[i], alpha=.2)
+    axes.scatter(unit_ceed_emb[:,0], unit_ceed_emb[:,1], color=colors[i], alpha=.3)
     axes.scatter(pc_template_emb[0], pc_template_emb[1], color=colors[i], alpha=1,
                 marker="^", s=200, label=str(unit_id), edgecolors='black', linewidths=1)
 
@@ -255,7 +255,7 @@ for i, unit_id in enumerate(unit_ids):
     axes[0].plot(template.T + vertical_offset, color=colors[i], alpha=1)
     axes[0].annotate(str(unit_id), xy=(0,vertical_offset+.3))
     vertical_offset += 1.5
-    axes[1].scatter(unit_ceed_emb[:,0], unit_ceed_emb[:,1], color=colors[i], alpha=.1)
+    axes[1].scatter(unit_ceed_emb[:,0], unit_ceed_emb[:,1], color=colors[i], alpha=.3)
     axes[1].scatter(pc_template_emb[0], pc_template_emb[1], color=colors[i], alpha=1,
                    marker="^", s=200, label=str(unit_id), edgecolors='black', linewidths=1)
 
@@ -303,7 +303,7 @@ for i, unit_id in enumerate(unit_ids):
     vertical_offset += 1.5
     
     # For UMAP, use median of embeddings (can't project new samples through fitted UMAP)
-    axes[1].scatter(unit_ceed_emb[:,0], unit_ceed_emb[:,1], color=colors[i], alpha=.1)
+    axes[1].scatter(unit_ceed_emb[:,0], unit_ceed_emb[:,1], color=colors[i], alpha=.3)
     median_emb = np.median(unit_ceed_emb, 0)
     axes[1].scatter(median_emb[0], median_emb[1], color=colors[i], alpha=1,
                    marker='*', s=200, label=str(unit_id), 
@@ -328,14 +328,205 @@ plt.savefig('umap_embeddings_with_waveforms.png', dpi=150, bbox_inches='tight')
 print('Saved: umap_embeddings_with_waveforms.png')
 
 
-
-# %% [markdown]
-# ### Transform without a data folder
-
-# %%
 # same output as two cells above, but takes in actual data
 cell_type_inference_data = np.load(os.path.join(celltype_test_data, 'spikes_test.npy'))
 print("cell type data:", cell_type_inference_data.shape)
 transformed_inference_data = fc_celltype_ceed_5d.transform(cell_type_inference_data)
 print(transformed_inference_data.shape)
 
+
+# ...existing code...
+
+# %%
+# Automatic cell type discovery using GMM clustering (CEED's approach)
+from sklearn.mixture import GaussianMixture
+from sklearn.metrics import silhouette_score
+
+print("\n" + "="*60)
+print("AUTOMATIC CELL TYPE DISCOVERY WITH GMM")
+print("="*60)
+
+# Use the 5D embeddings (before PCA) for clustering
+embeddings_5d = fc_pca_ceed_emb_nonzero  # Shape: (N, 105) after flattening
+
+# Scan 1-10 clusters and select best by BIC
+n_clusters_range = range(2, 11)
+bic_scores = []
+silhouette_scores = []
+gmm_models = []
+
+for n_clusters in n_clusters_range:
+    gmm = GaussianMixture(n_components=n_clusters, 
+                          covariance_type='full',
+                          random_state=42,
+                          n_init=10)
+    gmm.fit(embeddings_5d)
+    bic = gmm.bic(embeddings_5d)
+    bic_scores.append(bic)
+    gmm_models.append(gmm)
+    
+    # Silhouette score (alternative metric)
+    labels_pred = gmm.predict(embeddings_5d)
+    sil_score = silhouette_score(embeddings_5d, labels_pred)
+    silhouette_scores.append(sil_score)
+    
+    print(f"n_clusters={n_clusters}: BIC={bic:.1f}, Silhouette={sil_score:.3f}")
+
+# Find elbow in BIC curve
+bic_scores = np.array(bic_scores)
+bic_diffs = np.diff(bic_scores)
+bic_diffs2 = np.diff(bic_diffs)  # Second derivative
+elbow_idx = np.argmax(bic_diffs2) + 1  # +1 for diff offset, +1 for range start
+n_clusters_elbow = list(n_clusters_range)[elbow_idx]
+
+# Use minimum BIC as final choice
+n_clusters_best = list(n_clusters_range)[np.argmin(bic_scores)]
+
+print(f"\n*** Best by BIC minimum: {n_clusters_best} clusters ***")
+print(f"*** Best by BIC elbow: {n_clusters_elbow} clusters ***")
+
+# Use BIC minimum (standard approach)
+best_gmm = gmm_models[np.argmin(bic_scores)]
+celltype_labels_gmm = best_gmm.predict(embeddings_5d)
+
+# Create cell type names based on waveform characteristics
+celltype_names_gmm = {}
+for ct_id in np.unique(celltype_labels_gmm):
+    ct_spikes = spikes_nonzero[celltype_labels_gmm == ct_id]
+    ct_template = np.median(ct_spikes, 0)
+    
+    # Calculate spike width (trough to peak)
+    trough_idx = np.argmin(ct_template)
+    peak_idx = np.argmax(ct_template)
+    spike_width = abs(peak_idx - trough_idx)
+    
+    # Classify as narrow or broad
+    if spike_width < 15:
+        celltype_names_gmm[ct_id] = f'Type {ct_id}: Narrow-spiking'
+    elif spike_width < 25:
+        celltype_names_gmm[ct_id] = f'Type {ct_id}: Medium-spiking'
+    else:
+        celltype_names_gmm[ct_id] = f'Type {ct_id}: Broad-spiking'
+
+print(f"\nDiscovered cell types:")
+for ct_id, ct_name in celltype_names_gmm.items():
+    count = np.sum(celltype_labels_gmm == ct_id)
+    pct = 100 * count / len(celltype_labels_gmm)
+    print(f"  {ct_name}: {count} spikes ({pct:.1f}%)")
+
+# %%
+# Plot BIC curve and silhouette scores
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+# Left: BIC curve
+axes[0].plot(list(n_clusters_range), bic_scores, 'bo-', linewidth=2, markersize=8)
+axes[0].axvline(n_clusters_best, color='red', linestyle='--', linewidth=2, 
+               label=f'Best (BIC min): {n_clusters_best}')
+axes[0].axvline(n_clusters_elbow, color='orange', linestyle='--', linewidth=2, 
+               label=f'Elbow: {n_clusters_elbow}')
+axes[0].set_xlabel('Number of clusters', fontsize=12)
+axes[0].set_ylabel('BIC (lower is better)', fontsize=12)
+axes[0].set_title('GMM Model Selection: BIC Curve', fontsize=13, fontweight='bold')
+axes[0].legend(fontsize=10)
+axes[0].grid(alpha=0.3)
+
+# Right: Silhouette scores
+axes[1].plot(list(n_clusters_range), silhouette_scores, 'go-', linewidth=2, markersize=8)
+axes[1].axvline(n_clusters_best, color='red', linestyle='--', linewidth=2, 
+               label=f'BIC choice: {n_clusters_best}')
+axes[1].set_xlabel('Number of clusters', fontsize=12)
+axes[1].set_ylabel('Silhouette score (higher is better)', fontsize=12)
+axes[1].set_title('Cluster Quality: Silhouette Score', fontsize=13, fontweight='bold')
+axes[1].legend(fontsize=10)
+axes[1].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('gmm_model_selection.png', dpi=150, bbox_inches='tight')
+print('Saved: gmm_model_selection.png')
+
+# %%
+# Visualize discovered cell types
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+unique_celltypes_gmm = np.unique(celltype_labels_gmm)
+colors_celltypes = cc.glasbey[:len(unique_celltypes_gmm)]
+
+# Top left: Cell type waveforms overlaid
+for i, ct_id in enumerate(unique_celltypes_gmm):
+    ct_spikes = spikes_nonzero[celltype_labels_gmm == ct_id]
+    ct_name = celltype_names_gmm.get(ct_id, f'Type {ct_id}')
+    
+    sample_idx = np.random.choice(len(ct_spikes), size=min(100, len(ct_spikes)), replace=False)
+    axes[0, 0].plot(ct_spikes[sample_idx].T, color=colors_celltypes[i], alpha=0.02)
+    
+    template = np.median(ct_spikes, 0)
+    axes[0, 0].plot(template, color=colors_celltypes[i], linewidth=3, label=ct_name)
+
+axes[0, 0].axvline(42, color='black', linestyle='--', alpha=0.5)
+axes[0, 0].set_xlabel('Sample (timepoint)', fontsize=11)
+axes[0, 0].set_ylabel('Amplitude', fontsize=11)
+axes[0, 0].set_title('Discovered Cell Type Waveforms', fontsize=12, fontweight='bold')
+axes[0, 0].legend(fontsize=9)
+axes[0, 0].grid(alpha=0.3, axis='x')
+
+# Top right: Cell type waveforms stacked
+vertical_offset = 0
+for i, ct_id in enumerate(unique_celltypes_gmm):
+    ct_spikes = spikes_nonzero[celltype_labels_gmm == ct_id]
+    ct_name = celltype_names_gmm.get(ct_id, f'Type {ct_id}')
+    
+    sample_idx = np.random.choice(len(ct_spikes), size=min(50, len(ct_spikes)), replace=False)
+    axes[0, 1].plot(ct_spikes[sample_idx].T + vertical_offset, 
+                   color=colors_celltypes[i], alpha=0.05, linewidth=0.5)
+    
+    template = np.median(ct_spikes, 0)
+    axes[0, 1].plot(template + vertical_offset, color=colors_celltypes[i], linewidth=2.5)
+    axes[0, 1].annotate(ct_name, xy=(5, vertical_offset + 0.5), fontsize=9, fontweight='bold')
+    vertical_offset += 2.5
+
+axes[0, 1].axvline(42, color='black', linestyle='--', alpha=0.5)
+axes[0, 1].set_xlabel('Sample (timepoint)', fontsize=11)
+axes[0, 1].set_ylabel('Amplitude (offset per type)', fontsize=11)
+axes[0, 1].set_title('Stacked Cell Type Waveforms', fontsize=12, fontweight='bold')
+axes[0, 1].set_ylim(-1, vertical_offset)
+axes[0, 1].grid(alpha=0.3, axis='x')
+
+# Bottom left: PCA embeddings colored by discovered cell types
+for i, ct_id in enumerate(unique_celltypes_gmm):
+    ct_emb = fc_pca_ceed_emb[celltype_labels_gmm == ct_id]
+    ct_name = celltype_names_gmm.get(ct_id, f'Type {ct_id}')
+    axes[1, 0].scatter(ct_emb[:, 0], ct_emb[:, 1], 
+                      color=colors_celltypes[i], alpha=0.4, s=15, label=ct_name)
+    centroid = np.median(ct_emb, axis=0)
+    axes[1, 0].scatter(centroid[0], centroid[1], 
+                      color=colors_celltypes[i], marker='*', s=500, 
+                      edgecolors='black', linewidths=2, zorder=10)
+
+axes[1, 0].set_xlabel('PC1', fontsize=11)
+axes[1, 0].set_ylabel('PC2', fontsize=11)
+axes[1, 0].set_title('PCA: GMM-Discovered Cell Types', fontsize=12, fontweight='bold')
+axes[1, 0].legend(fontsize=9)
+axes[1, 0].grid(alpha=0.3)
+
+# Bottom right: UMAP embeddings colored by discovered cell types
+for i, ct_id in enumerate(unique_celltypes_gmm):
+    ct_emb = fc_umap_ceed_emb[celltype_labels_gmm == ct_id]
+    ct_name = celltype_names_gmm.get(ct_id, f'Type {ct_id}')
+    axes[1, 1].scatter(ct_emb[:, 0], ct_emb[:, 1], 
+                      color=colors_celltypes[i], alpha=0.4, s=15, label=ct_name)
+    centroid = np.median(ct_emb, axis=0)
+    axes[1, 1].scatter(centroid[0], centroid[1], 
+                      color=colors_celltypes[i], marker='*', s=500, 
+                      edgecolors='black', linewidths=2, zorder=10)
+
+axes[1, 1].set_xlabel('UMAP1', fontsize=11)
+axes[1, 1].set_ylabel('UMAP2', fontsize=11)
+axes[1, 1].set_title('UMAP: GMM-Discovered Cell Types', fontsize=12, fontweight='bold')
+axes[1, 1].legend(fontsize=9)
+axes[1, 1].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('gmm_discovered_celltypes.png', dpi=150, bbox_inches='tight')
+print('Saved: gmm_discovered_celltypes.png')
+
+# ...existing code...
