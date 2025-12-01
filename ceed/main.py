@@ -511,6 +511,8 @@ if __name__ == "__main__":
     parser.add_argument("--online_head", action="store_true")  # default = False
     parser.add_argument("--ddp", action="store_true")
     parser.add_argument("--rank", default=0, type=int)
+    parser.add_argument("--dist_url", default="tcp://localhost:10001", type=str, help="url used to set up distributed training")
+    parser.add_argument("--world_size", default=1, type=int, help="number of distributed processes")
     parser.add_argument("--num_extra_chans", default=0, type=int)
     parser.add_argument("--multi_chan", action="store_true")
     

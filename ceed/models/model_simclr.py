@@ -37,7 +37,7 @@ class FullyConnectedEnc(nn.Module):
         Lv=[768, 512, 256],
         out_size=2,
         proj_dim=5,
-        fc_depth=2,
+        fc_depth=10,
         multichan=False,
         old_ckpt=False,
     ):
@@ -45,6 +45,8 @@ class FullyConnectedEnc(nn.Module):
         self.proj_dim = proj_dim
         self.input_size = input_size
         self.multichan = multichan
+        self.fc_depth = fc_depth
+
         if old_ckpt:
             self.fcpart = nn.Sequential(
                 nn.Linear(input_size, Lv[0]),
@@ -58,22 +60,26 @@ class FullyConnectedEnc(nn.Module):
             )
             self.proj = nn.Identity(proj_dim)
         else:
-            self.fcpart = nn.Sequential(
-                nn.Linear(input_size, Lv[0]),
-                nn.ReLU(),
-                nn.Linear(Lv[0], Lv[1]),
-                nn.ReLU(),
-                nn.Linear(Lv[1], Lv[2]),
-                nn.ReLU(),
-                nn.Linear(Lv[2], out_size),
-            )
+            self.fcpart = nn.ModuleList()  # ← Lista több blokkhoz!
+            for i in range(fc_depth):  # ← 10-szer fut le!
+                block = nn.Sequential(
+                    nn.Linear(input_size if i==0 else out_size, Lv[0]),
+                    nn.ReLU(),
+                    nn.Linear(Lv[0], Lv[1]), nn.ReLU(),
+                    nn.Linear(Lv[1], Lv[2]), nn.ReLU(),
+                    nn.Linear(Lv[2], out_size),
+                )
+                self.fcpart.append(block)
+
             self.proj = Projector(rep_dim=out_size, proj_dim=self.proj_dim)
         self.Lv = Lv
 
     def forward(self, x):
         if self.multichan:
             x = x.view(-1, 1, self.input_size)
-        x = self.fcpart(x)
+        for block in self.fcpart:
+            x = block(x)
+    
         x = self.proj(x)
         return x
 
@@ -81,11 +87,30 @@ class FullyConnectedEnc(nn.Module):
         checkpoint = torch.load(fname_model, map_location="cpu")
         state_dict = checkpoint["state_dict"]
         new_state_dict = OrderedDict()
+        print(f"Loading from: {fname_model}")
+        print("Checkpoint keys sample:", list(state_dict.keys())[:5])
+        model_keys = set(self.state_dict().keys())
+
         for key in state_dict:
-            # if "backbone" in key and "fc" not in key:
+            # Prefix eltávolítás
             new_key = ".".join(key.split(".")[1:])
-            new_state_dict[new_key] = state_dict[key]
-        self.load_state_dict(new_state_dict)
+        
+            # proj_block → normál index
+            if "proj_block" in new_key:
+                new_key = new_key.replace(".proj_block.", ".")
+        
+        # Skip fcpart.8/9 (nincs modelledben)
+            if any(f"fcpart.{i}" in new_key for i in ["8", "9"]):
+                print(f"Skipping: {new_key}")
+                continue
+        
+        # Csak kompatibilis kulcsok
+            if new_key in model_keys:
+                new_state_dict[new_key] = state_dict[key]
+    
+            print(f"Loading {len(new_state_dict)}/{len(state_dict)} keys")
+        self.load_state_dict(new_state_dict, strict=False)
+        print("FullyConnectedEnc loaded successfully!")
         return self
 
 
@@ -230,7 +255,8 @@ class ModelSimCLR(nn.Module):
             self.backbone = model_dict[base_model](
                 out_size=out_dim,
                 proj_dim=proj_dim,
-                fc_depth=fc_depth,
+                #fc_depth=fc_depth,
+                fc_depth=10,
                 input_size=input_size,
                 multichan=multichan,
                 old_ckpt=old_ckpt,

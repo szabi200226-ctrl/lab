@@ -30,7 +30,7 @@ class CEED(object):
         proj_dim: int = 5,
         num_extra_chans: int = 0,
         gpu: int = 0,
-        old_ckpt: bool = False,
+        old_ckpt: bool = True,
     ):
         """
         Parameters
